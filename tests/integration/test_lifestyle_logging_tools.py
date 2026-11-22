@@ -5,7 +5,9 @@ The request shapes asserted here were captured from the Garmin Connect iOS
 app (5.31) talking to connectapi.garmin.com/lifestylelogging-service.
 """
 import copy
+import datetime
 import json
+import zoneinfo
 from unittest.mock import Mock
 
 import pytest
@@ -216,6 +218,7 @@ async def test_log_quantity_with_sub_types(app, client):
     ({"behavior_id": 1, "amount": 2}, "counted per sub-type"),
     ({"behavior_id": 1}, "sub_type_amounts is required"),
     ({"behavior_id": 1, "sub_type_amounts": {"CIDER": 1}}, "Unknown sub-type"),
+    ({"behavior_id": 1, "sub_type_amounts": {"beer": 1, "BEER": 2}}, "more than once"),
     ({"behavior_id": 999}, "No lifestyle behavior with id 999"),
 ])
 @pytest.mark.asyncio
@@ -491,3 +494,105 @@ async def test_set_auto_logging_error(app, client):
     data = await _call_json(app, "set_lifestyle_auto_logging", {"enabled": False})
     assert data["status"] == "error"
     assert data["upstream_status"] == 403
+
+
+# --- review follow-ups ---------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_default_date_uses_garmin_timezone(app, client):
+    # UTC+14: the user's "today" is usually not the server's.
+    client.get_userprofile_settings.return_value = {"timeZone": "Pacific/Kiritimati"}
+    data = await _call_json(app, "get_lifestyle_behaviors", {})
+    expected = datetime.datetime.now(zoneinfo.ZoneInfo("Pacific/Kiritimati")).date().isoformat()
+    assert data["date"] == expected
+
+
+@pytest.mark.asyncio
+async def test_default_date_falls_back_when_settings_fail(app, client):
+    client.get_userprofile_settings.side_effect = Exception("settings down")
+    data = await _call_json(app, "get_lifestyle_behaviors", {})
+    assert data["date"] == datetime.datetime.now().astimezone().date().isoformat()
+
+
+@pytest.mark.asyncio
+async def test_create_leaves_tracked_list_alone_when_it_cannot_be_read(app, client):
+    def connectapi(path, **kwargs):
+        if path.startswith("/lifestylelogging-service/behaviours/"):
+            return None
+        return _connectapi(path, **kwargs)
+
+    client.connectapi.side_effect = connectapi
+    client.client.post.side_effect = lambda *a, **kw: _created(kw["json"])
+    data = await _call_json(app, "create_lifestyle_behaviors", {"behaviors": [{"name": "Stretch"}]})
+    assert data["status"] == "partial"
+    assert "left unchanged" in data["tracking_error"]
+    client.client.put.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_create_reports_garmin_rejection(app, client):
+    client.client.post.side_effect = GarminConnectConnectionError("API Error 400 - Bad Request")
+    data = await _call_json(app, "create_lifestyle_behaviors", {"behaviors": [{"name": "Stretch"}]})
+    assert data["status"] == "error"
+    assert data["upstream_status"] == 400
+    assert data["write_committed"] is False
+    client.client.put.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_update_error_after_send_is_unknown(app, client):
+    client.client.put.side_effect = GarminConnectConnectionError("API Error 500 - Server Error")
+    data = await _call_json(app, "update_lifestyle_behavior", {"behavior_id": 1001, "name": "Brunch"})
+    assert data["status"] == "error"
+    assert data["write_committed"] == "unknown"
+
+
+@pytest.mark.asyncio
+async def test_delete_retry_skips_already_deleted_ids(app, client):
+    data = await _call_json(
+        app, "delete_lifestyle_behaviors", {"behavior_ids": [1001, 906715], "confirm": True}
+    )
+    _, payload = _sent(client.client.delete.call_args)
+    assert payload == {"ids": [1001]}
+    assert data["status"] == "success"
+    assert data["already_deleted"] == [906715]
+
+
+@pytest.mark.asyncio
+async def test_delete_when_everything_is_already_gone(app, client):
+    data = await _call_json(
+        app, "delete_lifestyle_behaviors", {"behavior_ids": [906715], "confirm": True}
+    )
+    assert data == {"status": "success", "deleted": [], "already_deleted": [906715]}
+    client.client.delete.assert_not_called()
+    client.client.put.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_delete_reports_garmin_rejection(app, client):
+    client.client.delete.side_effect = GarminConnectConnectionError("API Error 404 - Not Found")
+    data = await _call_json(
+        app, "delete_lifestyle_behaviors", {"behavior_ids": [1001], "confirm": True}
+    )
+    assert data["status"] == "error"
+    assert data["write_committed"] is False
+    client.client.put.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_set_tracked_reports_garmin_rejection(app, client):
+    client.client.put.side_effect = GarminConnectConnectionError("API Error 400 - Bad Request")
+    data = await _call_json(app, "set_tracked_lifestyle_behaviors", {"behavior_ids": [1, 3]})
+    assert data["status"] == "error"
+    assert data["upstream_status"] == 400
+    assert data["write_committed"] is False
+
+
+@pytest.mark.asyncio
+async def test_clear_confirmed_rejects_unknown_behavior(app, client):
+    data = await _call_json(
+        app, "clear_lifestyle_behavior_log",
+        {"date": "2024-01-15", "behavior_id": 999, "confirm": True},
+    )
+    assert "No lifestyle behavior with id 999" in data["message"]
+    client.client.delete.assert_not_called()

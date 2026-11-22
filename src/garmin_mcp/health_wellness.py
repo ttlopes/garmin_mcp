@@ -3,6 +3,7 @@ Health & Wellness Data functions for Garmin Connect MCP Server
 """
 import json
 import datetime
+import zoneinfo
 from typing import Any, Dict, List, Optional, Union
 
 from garmin_mcp.write_errors import WriteTracker
@@ -498,10 +499,27 @@ _LIFESTYLE_MAX_AMOUNT = 25  # the app's "Enter 1-25" limit
 _MEASUREMENT_TYPES = ("NONE", "QUANTITY")
 
 
+def _user_now() -> datetime.datetime:
+    """Current time in the user's Garmin timezone.
+
+    The server may run somewhere else (the Docker image runs in UTC), so
+    "today" comes from the timeZone in the user's Garmin settings. Falls back
+    to the server's local time when that is unavailable.
+    """
+    try:
+        settings = garmin_client.get_userprofile_settings()
+        tz_name = settings.get("timeZone") if isinstance(settings, dict) else None
+        if isinstance(tz_name, str) and tz_name:
+            return datetime.datetime.now(zoneinfo.ZoneInfo(tz_name))
+    except Exception:
+        pass
+    return datetime.datetime.now().astimezone()
+
+
 def _lifestyle_date(value: Optional[str], field: str = "date") -> str:
-    """Return ``value`` as YYYY-MM-DD (today when None), or raise ValueError."""
+    """Return ``value`` as YYYY-MM-DD (the user's today when None), or raise ValueError."""
     if value is None:
-        return datetime.date.today().isoformat()
+        return _user_now().date().isoformat()
     try:
         return datetime.date.fromisoformat(value).isoformat()
     except (TypeError, ValueError):
@@ -549,8 +567,8 @@ def _find_behavior(behaviors: List[Dict[str, Any]], behavior_id: int) -> Dict[st
 
 
 def _lifestyle_update_timestamp() -> str:
-    """Local time with tenths of a second, the format the app sends."""
-    now = datetime.datetime.now()
+    """The user's local time with tenths of a second, the format the app sends."""
+    now = _user_now()
     return f"{now:%Y-%m-%dT%H:%M:%S}.{now.microsecond // 100000}"
 
 
@@ -1759,6 +1777,7 @@ def register_tools(app):
                     raise ValueError(f"sub_type_amounts is required to log '{name}'")
                 by_name = {str(s.get("name")).upper(): s for s in sub_types}
                 details = []
+                seen_sub_types = set()
                 for key, value in sub_type_amounts.items():
                     sub_type = by_name.get(str(key).strip().upper())
                     if sub_type is None:
@@ -1766,6 +1785,11 @@ def register_tools(app):
                             f"Unknown sub-type '{key}' for '{name}'; expected one of "
                             + ", ".join(by_name)
                         )
+                    if sub_type.get("subTypeId") in seen_sub_types:
+                        raise ValueError(
+                            f"Sub-type '{sub_type.get('name')}' is given more than once"
+                        )
+                    seen_sub_types.add(sub_type.get("subTypeId"))
                     details.append({
                         "subTypeId": sub_type.get("subTypeId"),
                         "subTypeName": "",
@@ -1843,6 +1867,9 @@ def register_tools(app):
                     "entry": entry,
                     "message": "Review this entry, then call again with confirm=true to delete it.",
                 }, indent=2)
+            # Garmin answers 204 even for an id that doesn't exist, so check it
+            # here rather than report clearing an entry that was never there.
+            _find_behavior(_lifestyle_behaviors(day), behavior_id)
             tracker.sending()
             garmin_client.client.delete(
                 "connectapi", f"{_LIFESTYLE_URL}/dailyLog/{behavior_id}/{day}"
@@ -1909,6 +1936,12 @@ def register_tools(app):
                 new_ids = [b["behaviourId"] for b in created if "behaviourId" in b]
                 try:
                     tracked = [b["behaviourId"] for b in existing if b.get("tracked")]
+                    if not tracked:
+                        # Writing [new ids] here would untrack everything else
+                        # if the list simply failed to load, so leave it alone.
+                        raise ValueError(
+                            "Could not read the current tracked list, so it was left unchanged"
+                        )
                     profile_pk = created[0].get("userProfilePk") or _lifestyle_profile_pk(existing)
                     _put_tracked_behaviors(
                         tracked + [i for i in new_ids if i not in tracked], day, profile_pk
@@ -2003,7 +2036,13 @@ def register_tools(app):
             ids = list(dict.fromkeys(behavior_ids))
             day = _lifestyle_date(None)
             existing = _lifestyle_behaviors(day)
-            targets = [_find_behavior(existing, i) for i in ids]
+            if not existing:
+                raise ValueError("Could not read the behavior list; nothing was deleted")
+            by_id = {b.get("behaviourId"): b for b in existing}
+            targets = [by_id[i] for i in ids if i in by_id]
+            # Ids that are no longer listed were already deleted (e.g. by an
+            # earlier attempt that timed out), so a retry still succeeds.
+            already_deleted = [i for i in ids if i not in by_id]
             built_in = [t.get("name") for t in targets if not _is_custom_behavior(t)]
             if built_in:
                 raise ValueError(
@@ -2011,21 +2050,29 @@ def register_tools(app):
                     + ". Use set_tracked_lifestyle_behaviors to stop tracking them."
                 )
             if not confirm:
-                return json.dumps({
+                preview: Dict[str, Any] = {
                     "status": "needs_confirmation",
                     "behaviors": [_behavior_summary(t) for t in targets],
                     "message": "Review these behaviors, then call again with confirm=true to permanently delete them.",
-                }, indent=2)
+                }
+                if already_deleted:
+                    preview["not_found"] = already_deleted
+                return json.dumps(preview, indent=2)
 
-            tracker.sending()
-            garmin_client.client.delete(
-                "connectapi", f"{_LIFESTYLE_URL}/behaviours/batchDelete", json={"ids": ids}
-            )
-            tracker.committed()
             result: Dict[str, Any] = {
                 "status": "success",
                 "deleted": [{"id": t.get("behaviourId"), "name": t.get("name")} for t in targets],
             }
+            if already_deleted:
+                result["already_deleted"] = already_deleted
+            if not targets:
+                return json.dumps(result, indent=2)
+            delete_ids = [t.get("behaviourId") for t in targets]
+            tracker.sending()
+            garmin_client.client.delete(
+                "connectapi", f"{_LIFESTYLE_URL}/behaviours/batchDelete", json={"ids": delete_ids}
+            )
+            tracker.committed()
             tracked = [b["behaviourId"] for b in existing if b.get("tracked")]
             remaining = [i for i in tracked if i not in ids]
             if remaining != tracked:
@@ -2049,12 +2096,16 @@ def register_tools(app):
         """Choose which lifestyle behaviors are tracked, and their order
 
         Replaces the whole tracked list: behaviors left out stop showing up
-        for logging (their past entries are kept), and the app shows tracked
-        behaviors in this order. Start from the tracked ids in
-        get_lifestyle_behaviors and add, remove or reorder them.
+        for logging (their past entries are kept). Start from the tracked ids
+        in get_lifestyle_behaviors and add or remove ids.
+
+        The ids are sent in the order given, but Garmin's behavior list doesn't
+        report a custom order, and create_lifestyle_behaviors and
+        delete_lifestyle_behaviors rewrite the list in Garmin's default order.
+        Don't rely on the order being kept.
 
         Args:
-            behavior_ids: Every behavior id to track, in display order
+            behavior_ids: Every behavior id to track
             date: Date the change applies from, YYYY-MM-DD (defaults to today)
         """
         tracker = WriteTracker(
