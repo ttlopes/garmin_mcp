@@ -20,6 +20,7 @@ ADDITIVE_TOOLS = frozenset(
         "add_weigh_in",
         "add_weigh_in_with_timestamps",
         "create_custom_food",
+        "create_lifestyle_behaviors",
         "create_manual_activity",
         "create_run_interval_workout",
         "create_run_workout",
@@ -48,16 +49,19 @@ ADDITIVE_TOOLS = frozenset(
 # they are deliberately not marked read-only either.
 DESTRUCTIVE_TOOLS = frozenset(
     {
+        "clear_lifestyle_behavior_log",
         "delete_activity",
         "delete_course",
         "delete_custom_food",
         "delete_food_log",
+        "delete_lifestyle_behaviors",
         "delete_weigh_ins",
         "delete_workout",
         "delete_workouts",
         "download_activity_file",
         "download_course_gpx",
         "download_workout",
+        "log_lifestyle_behavior",
         "remove_gear_from_activity",
         "reschedule_workout",
         "set_activity_description",
@@ -67,11 +71,14 @@ DESTRUCTIVE_TOOLS = frozenset(
         "set_activity_name",
         "set_activity_type",
         "set_heart_rate_zones",
+        "set_lifestyle_auto_logging",
         "set_nutrition_daily_settings",
         "set_perceived_effort",
+        "set_tracked_lifestyle_behaviors",
         "unschedule_workout",
         "unschedule_workouts",
         "update_custom_food",
+        "update_lifestyle_behavior",
     }
 )
 
@@ -80,7 +87,17 @@ DESTRUCTIVE_TOOLS = frozenset(
 # arguments. Batch scheduling can also upload an inline workout, so it is
 # intentionally excluded even though its existing-workout path is guarded.
 IDEMPOTENT_TOOLS = frozenset(
-    {"reschedule_workout", "schedule_week", "schedule_workout"}
+    {
+        "clear_lifestyle_behavior_log",
+        "delete_lifestyle_behaviors",
+        "log_lifestyle_behavior",
+        "reschedule_workout",
+        "schedule_week",
+        "schedule_workout",
+        "set_lifestyle_auto_logging",
+        "set_tracked_lifestyle_behaviors",
+        "update_lifestyle_behavior",
+    }
 )
 
 
@@ -152,6 +169,7 @@ READ_ONLY_TOOLS = frozenset(
         "get_hydration_data",
         "get_inprogress_virtual_challenges",
         "get_lactate_threshold",
+        "get_lifestyle_behaviors",
         "get_lifestyle_logging_data",
         "get_menstrual_calendar_data",
         "get_menstrual_data_for_date",
