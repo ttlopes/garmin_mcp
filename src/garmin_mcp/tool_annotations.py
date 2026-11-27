@@ -220,6 +220,7 @@ READ_ONLY_TOOLS = frozenset(
         "get_weigh_ins",
         "get_workout_by_id",
         "get_workouts",
+        "lookup_food_by_barcode",
         "search_foods",
     }
 )

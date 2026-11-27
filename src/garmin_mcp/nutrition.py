@@ -279,6 +279,59 @@ def _find_food_log_entry(data, log_id):
     return None
 
 
+def _catalog_food_entry(item) -> Optional[dict]:
+    """Format one catalog food ({foodMetaData, nutritionContents}) for output."""
+    if not isinstance(item, dict):
+        return None
+    meta = item.get("foodMetaData")
+    if not isinstance(meta, dict):
+        return None
+    servings = []
+    for s in (item.get("nutritionContents") or []):
+        if not isinstance(s, dict):
+            continue
+        serving: dict = {
+            "serving_id": s.get("servingId"),
+            "serving_unit": s.get("servingUnit"),
+            "number_of_units": s.get("numberOfUnits"),
+            "calories": s.get("calories"),
+            "carbs_g": s.get("carbs"),
+            "protein_g": s.get("protein"),
+            "fat_g": s.get("fat"),
+            "fiber_g": s.get("fiber"),
+            "sodium_mg": s.get("sodium"),
+        }
+        servings.append({k: v for k, v in serving.items() if v is not None})
+
+    entry: dict = {
+        "food_id": meta.get("foodId"),
+        "name": meta.get("foodName"),
+        "food_type": meta.get("foodType"),
+        "source": meta.get("source"),
+        "region": meta.get("regionCode"),
+        "language": meta.get("languageCode"),
+        "servings": servings,
+    }
+    if meta.get("brandName"):
+        entry["brand"] = meta["brandName"]
+    return {k: v for k, v in entry.items() if v is not None}
+
+
+# EAN-8, UPC-A (12), EAN-13 and GTIN-14 are all 8 to 14 digits.
+_BARCODE_RE = re.compile(r"\d{8,14}")
+_REGION_RE = re.compile(r"[A-Za-z]{2}")
+_LANGUAGE_RE = re.compile(r"[A-Za-z]{2,3}(-[A-Za-z0-9]{2,8})*")
+
+
+def _check_region_language(region_code: str, language_code: str) -> tuple:
+    """Validate and normalize a country code ("PT") and language tag ("pt-PT")."""
+    if not isinstance(region_code, str) or not _REGION_RE.fullmatch(region_code.strip()):
+        raise ValueError("region_code must be a two-letter country code, e.g. 'US' or 'PT'")
+    if not isinstance(language_code, str) or not _LANGUAGE_RE.fullmatch(language_code.strip()):
+        raise ValueError("language_code must be a language tag, e.g. 'en' or 'pt-PT'")
+    return region_code.strip().upper(), language_code.strip()
+
+
 def configure(client):
     """Configure the module with the Garmin client instance"""
     global garmin_client
@@ -540,40 +593,9 @@ def register_tools(app):
 
             results = []
             for item in raw_results:
-                if not isinstance(item, dict):
-                    continue
-                meta = item.get("foodMetaData")
-                if not isinstance(meta, dict):
-                    continue
-                servings = []
-                for s in (item.get("nutritionContents") or []):
-                    if not isinstance(s, dict):
-                        continue
-                    serving: dict = {
-                        "serving_id": s.get("servingId"),
-                        "serving_unit": s.get("servingUnit"),
-                        "number_of_units": s.get("numberOfUnits"),
-                        "calories": s.get("calories"),
-                        "carbs_g": s.get("carbs"),
-                        "protein_g": s.get("protein"),
-                        "fat_g": s.get("fat"),
-                        "fiber_g": s.get("fiber"),
-                        "sodium_mg": s.get("sodium"),
-                    }
-                    servings.append({k: v for k, v in serving.items() if v is not None})
-
-                entry: dict = {
-                    "food_id": meta.get("foodId"),
-                    "name": meta.get("foodName"),
-                    "food_type": meta.get("foodType"),
-                    "source": meta.get("source"),
-                    "region": meta.get("regionCode"),
-                    "language": meta.get("languageCode"),
-                    "servings": servings,
-                }
-                if meta.get("brandName"):
-                    entry["brand"] = meta["brandName"]
-                results.append({k: v for k, v in entry.items() if v is not None})
+                entry = _catalog_food_entry(item)
+                if entry is not None:
+                    results.append(entry)
 
             return json.dumps({
                 "count": len(results),
@@ -582,6 +604,69 @@ def register_tools(app):
             }, indent=2)
         except Exception as e:
             return f"Error searching foods: {str(e)}"
+
+    @app.tool()
+    async def lookup_food_by_barcode(
+        barcode: str,
+        region_code: str = "US",
+        language_code: str = "en",
+    ) -> str:
+        """Look up a packaged food by its barcode (EAN/UPC), like the app's scanner
+
+        Returns the matching catalog food with food_id, source, name, brand and
+        its servings with macros, in the same shape as search_foods. Garmin's
+        catalog (mostly FatSecret) is regional, so pass the country the product
+        was bought in: the same barcode can return a different entry, or none,
+        in another region.
+
+        To log the result, pass its food_id, a serving_id, source, region and
+        language to log_custom_food (as region_code and language_code).
+
+        Args:
+            barcode: Digits printed under the barcode (8-14 digits; spaces and
+                dashes are ignored)
+            region_code: Two-letter country code, e.g. "US", "GB", "PT" (default "US")
+            language_code: Language tag for names, e.g. "en", "pt-PT" (default "en")
+        """
+        try:
+            code = re.sub(r"[\s-]", "", barcode or "")
+            if not _BARCODE_RE.fullmatch(code):
+                return "Error: barcode must be 8 to 14 digits (EAN-8, UPC-A, EAN-13 or GTIN-14)."
+            region, language = _check_region_language(region_code, language_code)
+            try:
+                data = garmin_client.connectapi(
+                    "/nutrition-service/food/search/barCode",
+                    params={
+                        "barCode": code,
+                        "regionCode": region,
+                        "languageCode": language,
+                        "phoneCountryCode": region,
+                    },
+                )
+            except Exception as e:
+                if _has_http_status(e, 404):
+                    data = None
+                else:
+                    raise
+            # The endpoint returns one food object; tolerate a list just in case.
+            if isinstance(data, list):
+                data = next((d for d in data if isinstance(d, dict)), None)
+            food = _catalog_food_entry(data)
+            if food is None:
+                return json.dumps({
+                    "status": "not_found",
+                    "barcode": code,
+                    "region": region,
+                    "message": (
+                        f"No food found for barcode {code} in region {region}. Try the "
+                        "region where the product is sold, or search_foods by name."
+                    ),
+                }, indent=2)
+            if isinstance(data, dict) and data.get("isFavorite") is not None:
+                food["is_favorite"] = bool(data.get("isFavorite"))
+            return json.dumps({"status": "found", "barcode": code, "food": food}, indent=2)
+        except Exception as e:
+            return f"Error looking up barcode: {str(e)}"
 
     @app.tool()
     async def get_custom_foods(
@@ -963,6 +1048,8 @@ def register_tools(app):
         serving_id: str,
         serving_qty: float = 1,
         source: str = "GARMIN",
+        region_code: str = "US",
+        language_code: str = "en",
     ) -> str:
         """Log a food item to a meal on a date
 
@@ -988,12 +1075,17 @@ def register_tools(app):
             serving_id: Serving ID from get_custom_foods or search_foods
             serving_qty: Number of servings (default 1)
             source: Food namespace — "GARMIN" (default) or "FATSECRET"
+            region_code: Catalog region of the food, e.g. "US" or "PT" — use the
+                region from lookup_food_by_barcode or search_foods (default "US")
+            language_code: Catalog language of the food, e.g. "en" or "pt-PT"
+                (default "en")
         """
         tracker = WriteTracker("log_custom_food", "Error logging food")
         try:
             from datetime import datetime, timezone
 
             _validate_meal_datetime(meal_date, meal_time)
+            region_code, language_code = _check_region_language(region_code, language_code)
 
             meals_url = f"/nutrition-service/meals/{meal_date}"
             meals_data = garmin_client.connectapi(meals_url)
@@ -1028,8 +1120,8 @@ def register_tools(app):
                         "foodId": food_id,
                         "servingId": serving_id,
                         "source": source,
-                        "regionCode": "US",
-                        "languageCode": "en",
+                        "regionCode": region_code,
+                        "languageCode": language_code,
                         "servingQty": serving_qty,
                     }
                 ],
