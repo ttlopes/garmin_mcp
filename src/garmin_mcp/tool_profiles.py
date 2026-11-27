@@ -1,6 +1,6 @@
 """Built-in tool profiles for GARMIN_TOOL_PROFILE.
 
-The server registers 165 tools. A profile narrows that to one area so an LLM
+The server registers 166 tools. A profile narrows that to one area so an LLM
 client carries less context, without the user having to list tool names in
 GARMIN_ENABLED_TOOLS. Each profile is a set of registered tool names; a unit
 test checks every name here against the tools the modules actually register,
@@ -236,6 +236,7 @@ NUTRITION_TOOLS = CORE_TOOLS | frozenset(
         "get_nutrition_summary_between_dates",
         "log_custom_food",
         "log_food",
+        "lookup_food_by_barcode",
         "search_foods",
         "set_nutrition_daily_settings",
         "update_custom_food",

@@ -612,6 +612,10 @@
       "description": "Log a lifestyle behavior for a day (yes/no or a count)"
     },
     {
+      "name": "lookup_food_by_barcode",
+      "description": "Look up a packaged food by its barcode (EAN/UPC), like the app's scanner"
+    },
+    {
       "name": "push_workout_to_device",
       "description": "Send a workout from the workout library to a Garmin device"
     },

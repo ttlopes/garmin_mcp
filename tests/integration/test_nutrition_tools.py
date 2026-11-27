@@ -2459,3 +2459,177 @@ async def test_upsert_response_decode_commit_status_refers_to_food_log(
         assert data["custom_food_created"] is True
         assert "not logged" in data["hint"]
     mock_garmin_client.client.put.assert_called_once()
+
+
+# lookup_food_by_barcode tests
+
+# GET /nutrition-service/food/search/barCode response, captured from the
+# Garmin Connect iOS app scanning a Coca-Cola Zero can in Portugal.
+_BARCODE_RESPONSE = {
+    "foodMetaData": {
+        "foodId": "3291590",
+        "foodName": "Coca-Cola Zero",
+        "foodType": "BRAND",
+        "brandName": "Coca-Cola",
+        "source": "FATSECRET",
+        "regionCode": "PT",
+        "languageCode": "pt-PT",
+    },
+    "nutritionContents": [
+        {
+            "servingId": "3202246", "servingUnit": "100ml", "numberOfUnits": 1.0,
+            "calories": 0, "carbs": 0.0, "protein": 0.0, "fat": 0.0, "fiber": 0.0,
+            "sugar": 0.0, "saturatedFat": 0.0, "sodium": 0.0, "unitHasServing": True,
+        },
+        {
+            "servingId": "3291590_0_100_ml", "servingUnit": "ml", "numberOfUnits": 100.0,
+            "calories": 0, "carbs": 0.0, "protein": 0.0, "fat": 0.0, "fiber": 0.0,
+            "sugar": 0.0, "saturatedFat": 0.0, "sodium": 0.0, "unitHasServing": False,
+        },
+    ],
+    "isFavorite": False,
+}
+
+
+@pytest.mark.asyncio
+async def test_lookup_food_by_barcode_found(app_with_nutrition, mock_garmin_client):
+    """lookup_food_by_barcode sends the app's query and formats the food."""
+    mock_garmin_client.connectapi.return_value = _BARCODE_RESPONSE
+
+    result = await app_with_nutrition.call_tool(
+        "lookup_food_by_barcode",
+        {"barcode": "5 000112-686333", "region_code": "pt", "language_code": "pt-PT"},
+    )
+    data = json.loads(result[0][0].text)
+    mock_garmin_client.connectapi.assert_called_once_with(
+        "/nutrition-service/food/search/barCode",
+        params={
+            "barCode": "5000112686333",
+            "regionCode": "PT",
+            "languageCode": "pt-PT",
+            "phoneCountryCode": "PT",
+        },
+    )
+    assert data["status"] == "found"
+    assert data["barcode"] == "5000112686333"
+    food = data["food"]
+    assert food["food_id"] == "3291590"
+    assert food["name"] == "Coca-Cola Zero"
+    assert food["brand"] == "Coca-Cola"
+    assert food["source"] == "FATSECRET"
+    assert food["region"] == "PT"
+    assert food["language"] == "pt-PT"
+    assert food["is_favorite"] is False
+    assert [s["serving_id"] for s in food["servings"]] == ["3202246", "3291590_0_100_ml"]
+    assert food["servings"][0]["calories"] == 0
+
+
+@pytest.mark.asyncio
+async def test_lookup_food_by_barcode_defaults_to_us(app_with_nutrition, mock_garmin_client):
+    mock_garmin_client.connectapi.return_value = _BARCODE_RESPONSE
+    await app_with_nutrition.call_tool("lookup_food_by_barcode", {"barcode": "012345678905"})
+    params = mock_garmin_client.connectapi.call_args[1]["params"]
+    assert params["regionCode"] == "US"
+    assert params["languageCode"] == "en"
+    assert params["phoneCountryCode"] == "US"
+
+
+@pytest.mark.parametrize("response", [None, {}, {"foodMetaData": None}])
+@pytest.mark.asyncio
+async def test_lookup_food_by_barcode_empty_is_not_found(
+    app_with_nutrition, mock_garmin_client, response
+):
+    mock_garmin_client.connectapi.return_value = response
+    result = await app_with_nutrition.call_tool(
+        "lookup_food_by_barcode", {"barcode": "5000112686333", "region_code": "PT"}
+    )
+    data = json.loads(result[0][0].text)
+    assert data["status"] == "not_found"
+    assert data["region"] == "PT"
+
+
+@pytest.mark.asyncio
+async def test_lookup_food_by_barcode_404_is_not_found(app_with_nutrition, mock_garmin_client):
+    mock_garmin_client.connectapi.side_effect = GarminConnectConnectionError(
+        "API Error 404 - Not Found"
+    )
+    result = await app_with_nutrition.call_tool(
+        "lookup_food_by_barcode", {"barcode": "5000112686333"}
+    )
+    assert json.loads(result[0][0].text)["status"] == "not_found"
+
+
+@pytest.mark.asyncio
+async def test_lookup_food_by_barcode_error(app_with_nutrition, mock_garmin_client):
+    mock_garmin_client.connectapi.side_effect = Exception("503 Service Unavailable")
+    result = await app_with_nutrition.call_tool(
+        "lookup_food_by_barcode", {"barcode": "5000112686333"}
+    )
+    assert "Error looking up barcode" in result[0][0].text
+
+
+@pytest.mark.parametrize("args, message", [
+    ({"barcode": "1234567"}, "8 to 14 digits"),
+    ({"barcode": "500011268633X"}, "8 to 14 digits"),
+    ({"barcode": "123456789012345"}, "8 to 14 digits"),
+    ({"barcode": "5000112686333", "region_code": "PRT"}, "two-letter country code"),
+    ({"barcode": "5000112686333", "language_code": "português"}, "language tag"),
+])
+@pytest.mark.asyncio
+async def test_lookup_food_by_barcode_rejects_bad_input(
+    app_with_nutrition, mock_garmin_client, args, message
+):
+    result = await app_with_nutrition.call_tool("lookup_food_by_barcode", args)
+    assert message in result[0][0].text
+    mock_garmin_client.connectapi.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_log_custom_food_with_barcode_region(app_with_nutrition, mock_garmin_client):
+    """A food found by barcode in another region is logged with that region."""
+    mock_garmin_client.connectapi.return_value = MOCK_MEALS
+    mock_garmin_client.client.put.return_value = {"status": "ok"}
+    await app_with_nutrition.call_tool(
+        "log_custom_food",
+        {
+            "meal_date": "2024-01-15",
+            "meal_time": "12:30:00",
+            "food_id": "3291590",
+            "serving_id": "3202246",
+            "source": "FATSECRET",
+            "region_code": "pt",
+            "language_code": "pt-PT",
+        },
+    )
+    item = mock_garmin_client.client.put.call_args[1]["json"]["foodLogItems"][0]
+    assert item["regionCode"] == "PT"
+    assert item["languageCode"] == "pt-PT"
+    assert item["source"] == "FATSECRET"
+
+
+@pytest.mark.asyncio
+async def test_log_custom_food_defaults_to_us_region(app_with_nutrition, mock_garmin_client):
+    mock_garmin_client.connectapi.return_value = MOCK_MEALS
+    mock_garmin_client.client.put.return_value = {"status": "ok"}
+    await app_with_nutrition.call_tool(
+        "log_custom_food",
+        {"meal_date": "2024-01-15", "meal_time": "12:30:00", "food_id": "abc123", "serving_id": "srv456"},
+    )
+    item = mock_garmin_client.client.put.call_args[1]["json"]["foodLogItems"][0]
+    assert (item["regionCode"], item["languageCode"]) == ("US", "en")
+
+
+@pytest.mark.asyncio
+async def test_log_custom_food_rejects_bad_region(app_with_nutrition, mock_garmin_client):
+    mock_garmin_client.connectapi.return_value = MOCK_MEALS
+    result = await app_with_nutrition.call_tool(
+        "log_custom_food",
+        {
+            "meal_date": "2024-01-15", "meal_time": "12:30:00", "food_id": "abc123",
+            "serving_id": "srv456", "region_code": "Portugal",
+        },
+    )
+    data = json.loads(result[0][0].text)
+    assert "two-letter country code" in data["message"]
+    assert data["write_committed"] is False
+    mock_garmin_client.client.put.assert_not_called()
