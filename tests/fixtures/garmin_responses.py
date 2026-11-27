@@ -454,22 +454,47 @@ MOCK_SPO2_DATA = {
     ]
 }
 
+# Shape of GET /lifestylelogging-service/dailyLog/{date}?showSubtypes=true.
+# Logged entries carry logStatus; quantity entries carry an amount per sub-type.
 MOCK_LIFESTYLE_LOGGING_DATA = {
     "calendarDate": "2024-01-15",
-    "lifestyleLogs": [
+    "dailyLogsReport": [
         {
-            "type": "caffeine_consumption",
-            "value": "2 cups",
-            "timestamp": "2024-01-15T08:00:00",
-            "notes": "Morning coffee"
+            "behaviourId": 1,
+            "measurementType": "QUANTITY",
+            "calendarDate": "2024-01-15",
+            "name": "Alcohol",
+            "logStatus": "YES",
+            "category": "LIFESTYLE",
+            "details": [
+                {"subTypeId": 1, "subTypeName": "BEER", "amount": 2},
+                {"subTypeId": 2, "subTypeName": "WINE"},
+                {"subTypeId": 3, "subTypeName": "SPIRIT", "amount": 1},
+                {"subTypeId": 4, "subTypeName": "OTHER"},
+            ],
+            "sleepRelated": False,
         },
         {
-            "type": "alcohol_consumption",
-            "value": "1 glass",
-            "timestamp": "2024-01-15T20:00:00",
-            "notes": "Red wine"
-        }
-    ]
+            "behaviourId": 35,
+            "measurementType": "NONE",
+            "calendarDate": "2024-01-15",
+            "name": "Illness",
+            "category": "LIFE_STATUS",
+            "sleepRelated": False,
+        },
+        {
+            "behaviourId": 1001,
+            "measurementType": "NONE",
+            "calendarDate": "2024-01-15",
+            "name": "Breakfast",
+            "logStatus": "YES",
+            "category": "CUSTOM",
+            "sleepRelated": False,
+        },
+    ],
+    "completionStats": [
+        {"calendarDate": "2024-01-15", "totalTracking": 3, "completedTracking": 2}
+    ],
 }
 
 # Challenges

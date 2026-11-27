@@ -3,7 +3,10 @@ Health & Wellness Data functions for Garmin Connect MCP Server
 """
 import json
 import datetime
+import zoneinfo
 from typing import Any, Dict, List, Optional, Union
+
+from garmin_mcp.write_errors import WriteTracker
 
 # The garmin_client will be set by the main file
 garmin_client = None
@@ -482,6 +485,147 @@ def _body_comp_gate_failure(xs: List[float]) -> Optional[str]:
             f"distinguishable from noise in that cluster alone"
         )
     return None
+
+
+# --- Lifestyle logging ------------------------------------------------------
+# None of these endpoints exist in python-garminconnect 0.3.2 (it only reads
+# the daily log), so they are called directly. Request shapes mirror what the
+# Garmin Connect iOS app (5.31) sends.
+
+_LIFESTYLE_URL = "/lifestylelogging-service"
+_AUTO_LOG_KEY = "lifestyle.auto-logging.enabled"
+_AUTO_LOG_URL = f"/userpreference-service/{_AUTO_LOG_KEY}"
+_LIFESTYLE_MAX_AMOUNT = 25  # the app's "Enter 1-25" limit
+_MEASUREMENT_TYPES = ("NONE", "QUANTITY")
+
+
+def _user_now() -> datetime.datetime:
+    """Current time in the user's Garmin timezone.
+
+    The server may run somewhere else (the Docker image runs in UTC), so
+    "today" comes from the timeZone in the user's Garmin settings. Falls back
+    to the server's local time when that is unavailable.
+    """
+    try:
+        settings = garmin_client.get_userprofile_settings()
+        tz_name = settings.get("timeZone") if isinstance(settings, dict) else None
+        if isinstance(tz_name, str) and tz_name:
+            return datetime.datetime.now(zoneinfo.ZoneInfo(tz_name))
+    except Exception:
+        pass
+    return datetime.datetime.now().astimezone()
+
+
+def _lifestyle_date(value: Optional[str], field: str = "date") -> str:
+    """Return ``value`` as YYYY-MM-DD (the user's today when None), or raise ValueError."""
+    if value is None:
+        return _user_now().date().isoformat()
+    try:
+        return datetime.date.fromisoformat(value).isoformat()
+    except (TypeError, ValueError):
+        raise ValueError(f"{field} must be a valid date in YYYY-MM-DD format") from None
+
+
+def _lifestyle_behaviors(date: str) -> List[Dict[str, Any]]:
+    """Fetch every behavior (built-in and custom) with its tracked state."""
+    data = garmin_client.connectapi(f"{_LIFESTYLE_URL}/behaviours/{date}")
+    if not isinstance(data, list):
+        return []
+    return [b for b in data if isinstance(b, dict) and "behaviourId" in b]
+
+
+def _is_custom_behavior(behavior: Dict[str, Any]) -> bool:
+    return str(behavior.get("category") or "").startswith("CUSTOM")
+
+
+def _behavior_summary(behavior: Dict[str, Any]) -> Dict[str, Any]:
+    summary = {
+        "id": behavior.get("behaviourId"),
+        "name": behavior.get("name"),
+        "category": behavior.get("category"),
+        "measurement_type": behavior.get("measurementType"),
+        "sub_types": [
+            s.get("name") for s in (behavior.get("subTypes") or []) if isinstance(s, dict)
+        ],
+        "tracked": behavior.get("tracked"),
+        "custom": _is_custom_behavior(behavior),
+        "sleep_related": behavior.get("sleepRelated"),
+        "auto_loggable": behavior.get("autoLoggable"),
+    }
+    if behavior.get("hidden"):
+        summary["hidden"] = True
+    return summary
+
+
+def _find_behavior(behaviors: List[Dict[str, Any]], behavior_id: int) -> Dict[str, Any]:
+    for behavior in behaviors:
+        if behavior.get("behaviourId") == behavior_id:
+            return behavior
+    raise ValueError(
+        f"No lifestyle behavior with id {behavior_id}; use get_lifestyle_behaviors to list ids"
+    )
+
+
+def _lifestyle_update_timestamp() -> str:
+    """The user's local time with tenths of a second, the format the app sends."""
+    now = _user_now()
+    return f"{now:%Y-%m-%dT%H:%M:%S}.{now.microsecond // 100000}"
+
+
+def _check_amount(value: Any, field: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{field} must be a whole number")
+    if not 1 <= value <= _LIFESTYLE_MAX_AMOUNT:
+        raise ValueError(f"{field} must be between 1 and {_LIFESTYLE_MAX_AMOUNT}")
+    return value
+
+
+def _lifestyle_profile_pk(behaviors: List[Dict[str, Any]]) -> Any:
+    """The user's profile id, which the tracked-behaviors endpoint expects."""
+    for behavior in behaviors:
+        if behavior.get("userProfilePk"):
+            return behavior["userProfilePk"]
+    profile = garmin_client.connectapi("/userprofile-service/socialProfile")
+    if isinstance(profile, dict) and profile.get("profileId"):
+        return profile["profileId"]
+    raise ValueError("Could not determine the Garmin user profile id")
+
+
+def _put_tracked_behaviors(ids: List[int], date: str, profile_pk: Any) -> Any:
+    return garmin_client.client.put(
+        "connectapi",
+        f"{_LIFESTYLE_URL}/trackedBehaviours",
+        json={"trackedBehaviours": ids, "calendarDate": date, "userProfilePk": profile_pk},
+        api=True,
+    )
+
+
+_NO_SKIP = object()
+
+
+def _check_behavior_name(
+    name: Any, existing: List[Dict[str, Any]], skip_id: Any = _NO_SKIP
+) -> str:
+    """Strip ``name`` and reject it if another behavior already uses it."""
+    if not isinstance(name, str) or not name.strip():
+        raise ValueError("name must be a non-empty string")
+    name = name.strip()
+    for behavior in existing:
+        if skip_id is not _NO_SKIP and behavior.get("behaviourId") == skip_id:
+            continue
+        if str(behavior.get("name") or "").casefold() == name.casefold():
+            raise ValueError(
+                f"A behavior named '{behavior.get('name')}' already exists "
+                f"(id {behavior.get('behaviourId')})"
+            )
+    return name
+
+
+def _check_measurement_type(value: Any) -> str:
+    kind = str(value or "").upper()
+    if kind not in _MEASUREMENT_TYPES:
+        raise ValueError("measurement_type must be 'NONE' (yes/no) or 'QUANTITY' (a count)")
+    return kind
 
 
 def register_tools(app):
@@ -1532,6 +1676,498 @@ def register_tools(app):
             return json.dumps(data, indent=2)
         except Exception as e:
             return f"Error retrieving lifestyle logging data: {str(e)}"
+
+    @app.tool()
+    async def get_lifestyle_behaviors(
+        date: Optional[str] = None, tracked_only: bool = False
+    ) -> str:
+        """List the lifestyle behaviors that can be logged, with their ids
+
+        Covers Garmin's built-in behaviors (Alcohol, Morning Caffeine, Illness,
+        Sauna, Screens Before Bed, ...) and the user's custom ones, in the order
+        the app shows them. Use the ids with log_lifestyle_behavior and the other
+        lifestyle tools. Also reports whether exercise auto-logging is on.
+
+        measurement_type is NONE for yes/no behaviors and QUANTITY for counted
+        ones. Quantity behaviors that list sub_types (e.g. Alcohol: BEER, WINE,
+        SPIRIT, OTHER) are logged per sub-type.
+
+        Args:
+            date: Date in YYYY-MM-DD format (defaults to today)
+            tracked_only: Only return behaviors the user currently tracks
+        """
+        try:
+            day = _lifestyle_date(date)
+            behaviors = _lifestyle_behaviors(day)
+            if not behaviors:
+                return f"No lifestyle behaviors found for {day}"
+            if tracked_only:
+                behaviors = [b for b in behaviors if b.get("tracked")]
+            try:
+                pref = garmin_client.connectapi(_AUTO_LOG_URL)
+                value = pref.get("value") if isinstance(pref, dict) else None
+                auto_logging = {"true": True, "false": False}.get(str(value).lower())
+            except Exception:
+                auto_logging = None
+            return json.dumps(
+                {
+                    "date": day,
+                    "auto_logging_enabled": auto_logging,
+                    "behaviors": [_behavior_summary(b) for b in behaviors],
+                },
+                indent=2,
+            )
+        except Exception as e:
+            return f"Error retrieving lifestyle behaviors: {str(e)}"
+
+    @app.tool()
+    async def log_lifestyle_behavior(
+        date: str,
+        behavior_id: int,
+        logged: bool = True,
+        amount: Optional[int] = None,
+        sub_type_amounts: Optional[Dict[str, int]] = None,
+    ) -> str:
+        """Log a lifestyle behavior for a day (yes/no or a count)
+
+        Sets the day's entry for one behavior, replacing whatever was logged
+        before. To change one sub-type of an entry, pass all the sub-types you
+        want to keep. Use get_lifestyle_behaviors for ids and sub-type names.
+
+        - Yes/no behaviors (measurement_type NONE): pass logged only.
+        - Quantity behaviors without sub-types (e.g. a custom "Midday
+          Caffeine"): pass logged=true and amount.
+        - Quantity behaviors with sub-types (Alcohol, Morning/Late Caffeine):
+          pass logged=true and sub_type_amounts, e.g. {"BEER": 2, "SPIRIT": 1}.
+        - logged=false records an explicit "No" (no amounts).
+
+        To remove an entry entirely instead, use clear_lifestyle_behavior_log.
+
+        Args:
+            date: Date in YYYY-MM-DD format
+            behavior_id: Behavior id from get_lifestyle_behaviors
+            logged: true for "Yes", false for "No"
+            amount: Count from 1 to 25, for quantity behaviors without sub-types
+            sub_type_amounts: Sub-type name to count (1-25), for quantity
+                behaviors with sub-types
+        """
+        tracker = WriteTracker("log_lifestyle_behavior", "Error logging lifestyle behavior")
+        try:
+            day = _lifestyle_date(date)
+            behavior = _find_behavior(_lifestyle_behaviors(day), behavior_id)
+            name = behavior.get("name")
+            quantity = behavior.get("measurementType") == "QUANTITY"
+            sub_types = [s for s in (behavior.get("subTypes") or []) if isinstance(s, dict)]
+
+            payload: Dict[str, Any] = {
+                "logStatus": "YES" if logged else "NO",
+                "updateTimestamp": _lifestyle_update_timestamp(),
+            }
+            if not logged or not quantity:
+                if amount is not None or sub_type_amounts:
+                    reason = "logged=false" if not logged else f"'{name}' is a yes/no behavior"
+                    raise ValueError(f"amount and sub_type_amounts are not allowed: {reason}")
+            elif sub_types:
+                if amount is not None:
+                    raise ValueError(
+                        f"'{name}' is counted per sub-type; pass sub_type_amounts with one of "
+                        + ", ".join(str(s.get("name")) for s in sub_types)
+                    )
+                if not sub_type_amounts:
+                    raise ValueError(f"sub_type_amounts is required to log '{name}'")
+                by_name = {str(s.get("name")).upper(): s for s in sub_types}
+                details = []
+                seen_sub_types = set()
+                for key, value in sub_type_amounts.items():
+                    sub_type = by_name.get(str(key).strip().upper())
+                    if sub_type is None:
+                        raise ValueError(
+                            f"Unknown sub-type '{key}' for '{name}'; expected one of "
+                            + ", ".join(by_name)
+                        )
+                    if sub_type.get("subTypeId") in seen_sub_types:
+                        raise ValueError(
+                            f"Sub-type '{sub_type.get('name')}' is given more than once"
+                        )
+                    seen_sub_types.add(sub_type.get("subTypeId"))
+                    details.append({
+                        "subTypeId": sub_type.get("subTypeId"),
+                        "subTypeName": "",
+                        "amount": _check_amount(value, f"sub_type_amounts['{key}']"),
+                    })
+                payload["details"] = details
+            else:
+                if sub_type_amounts:
+                    raise ValueError(f"'{name}' has no sub-types; pass amount instead")
+                if amount is None:
+                    raise ValueError(f"amount is required to log '{name}'")
+                payload["details"] = [{"amount": _check_amount(amount, "amount")}]
+
+            tracker.sending()
+            garmin_client.client.put(
+                "connectapi", f"{_LIFESTYLE_URL}/dailyLog/{behavior_id}/{day}", json=payload
+            )
+            tracker.committed()
+            result: Dict[str, Any] = {
+                "status": "success",
+                "date": day,
+                "behavior_id": behavior_id,
+                "behavior": name,
+                "logged": "YES" if logged else "NO",
+            }
+            if "details" in payload:
+                id_to_name = {s.get("subTypeId"): s.get("name") for s in sub_types}
+                result["amounts"] = [
+                    {"sub_type": id_to_name[d["subTypeId"]], "amount": d["amount"]}
+                    if "subTypeId" in d else {"amount": d["amount"]}
+                    for d in payload["details"]
+                ]
+            return json.dumps(result, indent=2)
+        except Exception as e:
+            return tracker.error(e)
+
+    @app.tool()
+    async def clear_lifestyle_behavior_log(
+        date: str, behavior_id: int, confirm: bool = False
+    ) -> str:
+        """Remove a behavior's entry for a day, leaving it unanswered
+
+        Unlike log_lifestyle_behavior with logged=false (an explicit "No"),
+        this deletes the day's entry and any amounts in it. The default call
+        previews the current entry; call again with confirm=true to delete it.
+
+        Args:
+            date: Date in YYYY-MM-DD format
+            behavior_id: Behavior id from get_lifestyle_behaviors
+            confirm: Set true to delete after reviewing the default preview
+        """
+        tracker = WriteTracker(
+            "clear_lifestyle_behavior_log", "Error clearing lifestyle behavior log"
+        )
+        try:
+            day = _lifestyle_date(date)
+            if not confirm:
+                log = garmin_client.connectapi(
+                    f"{_LIFESTYLE_URL}/dailyLog/{day}", params={"showSubtypes": "true"}
+                )
+                entries = log.get("dailyLogsReport") if isinstance(log, dict) else None
+                entry = next(
+                    (e for e in entries or [] if e.get("behaviourId") == behavior_id), None
+                )
+                if entry is None:
+                    return json.dumps({"status": "not_found", "date": day, "behavior_id": behavior_id})
+                if not entry.get("logStatus"):
+                    return json.dumps({
+                        "status": "nothing_logged", "date": day, "behavior_id": behavior_id,
+                        "behavior": entry.get("name"),
+                        "message": "Nothing is logged for this behavior on this day.",
+                    }, indent=2)
+                return json.dumps({
+                    "status": "needs_confirmation", "date": day, "behavior_id": behavior_id,
+                    "entry": entry,
+                    "message": "Review this entry, then call again with confirm=true to delete it.",
+                }, indent=2)
+            # Garmin answers 204 even for an id that doesn't exist, so check it
+            # here rather than report clearing an entry that was never there.
+            _find_behavior(_lifestyle_behaviors(day), behavior_id)
+            tracker.sending()
+            garmin_client.client.delete(
+                "connectapi", f"{_LIFESTYLE_URL}/dailyLog/{behavior_id}/{day}"
+            )
+            tracker.committed()
+            return json.dumps(
+                {"status": "success", "date": day, "behavior_id": behavior_id,
+                 "message": f"Cleared the entry for behavior {behavior_id} on {day}."},
+                indent=2,
+            )
+        except Exception as e:
+            return tracker.error(e)
+
+    @app.tool()
+    async def create_lifestyle_behaviors(
+        behaviors: List[Dict[str, Any]], track: bool = True
+    ) -> str:
+        """Create custom lifestyle behaviors
+
+        Each item is {"name": str, "measurement_type": "NONE" | "QUANTITY",
+        "sleep_related": bool}. NONE is a yes/no behavior, QUANTITY a count
+        (1-25, no sub-types). sleep_related puts it under Nighttime in the app.
+        Names must not match an existing behavior.
+
+        Garmin creates new behaviors untracked; with track=true (the default)
+        they are added to the end of the tracked list so they show up for
+        logging, as the app does.
+
+        Args:
+            behaviors: Behaviors to create (measurement_type defaults to NONE,
+                sleep_related to false)
+            track: Add the new behaviors to the tracked list
+        """
+        tracker = WriteTracker("create_lifestyle_behaviors", "Error creating lifestyle behaviors")
+        try:
+            if not isinstance(behaviors, list) or not behaviors:
+                raise ValueError("behaviors must be a non-empty list")
+            day = _lifestyle_date(None)
+            existing = _lifestyle_behaviors(day)
+            payload = []
+            seen: List[Dict[str, Any]] = list(existing)
+            for item in behaviors:
+                if not isinstance(item, dict):
+                    raise ValueError("each behavior must be an object with a name")
+                name = _check_behavior_name(item.get("name"), seen)
+                kind = _check_measurement_type(item.get("measurement_type", "NONE"))
+                sleep_related = item.get("sleep_related", False)
+                if not isinstance(sleep_related, bool):
+                    raise ValueError("sleep_related must be true or false")
+                payload.append({"name": name, "measurementType": kind, "sleepRelated": sleep_related})
+                seen.append({"name": name, "behaviourId": None})
+
+            tracker.sending()
+            created = garmin_client.client.post(
+                "connectapi", f"{_LIFESTYLE_URL}/behaviours/batch", json=payload, api=True
+            )
+            tracker.committed()
+            created = [b for b in created or [] if isinstance(b, dict)]
+            result: Dict[str, Any] = {
+                "status": "success",
+                "created": [_behavior_summary(b) for b in created],
+            }
+            if track and created:
+                new_ids = [b["behaviourId"] for b in created if "behaviourId" in b]
+                try:
+                    tracked = [b["behaviourId"] for b in existing if b.get("tracked")]
+                    if not tracked:
+                        # Writing [new ids] here would untrack everything else
+                        # if the list simply failed to load, so leave it alone.
+                        raise ValueError(
+                            "Could not read the current tracked list, so it was left unchanged"
+                        )
+                    profile_pk = created[0].get("userProfilePk") or _lifestyle_profile_pk(existing)
+                    _put_tracked_behaviors(
+                        tracked + [i for i in new_ids if i not in tracked], day, profile_pk
+                    )
+                    for summary in result["created"]:
+                        summary["tracked"] = True
+                except Exception as track_error:
+                    result["status"] = "partial"
+                    result["tracking_error"] = str(track_error)
+                    result["hint"] = (
+                        "The behaviors were created but not tracked. Call "
+                        "set_tracked_lifestyle_behaviors to add them."
+                    )
+            return json.dumps(result, indent=2)
+        except Exception as e:
+            return tracker.error(e)
+
+    @app.tool()
+    async def update_lifestyle_behavior(
+        behavior_id: int,
+        name: Optional[str] = None,
+        measurement_type: Optional[str] = None,
+        sleep_related: Optional[bool] = None,
+    ) -> str:
+        """Rename or change a custom lifestyle behavior
+
+        Only custom behaviors can be changed. Fields left out keep their
+        current value. Changing measurement_type on a behavior that already
+        has logged counts may affect how those past entries show.
+
+        Args:
+            behavior_id: Custom behavior id from get_lifestyle_behaviors
+            name: New name (must not match another behavior)
+            measurement_type: "NONE" (yes/no) or "QUANTITY" (a count)
+            sleep_related: true to show it under Nighttime in the app
+        """
+        tracker = WriteTracker("update_lifestyle_behavior", "Error updating lifestyle behavior")
+        try:
+            if name is None and measurement_type is None and sleep_related is None:
+                raise ValueError("Pass at least one of name, measurement_type or sleep_related")
+            existing = _lifestyle_behaviors(_lifestyle_date(None))
+            behavior = _find_behavior(existing, behavior_id)
+            if not _is_custom_behavior(behavior):
+                raise ValueError(
+                    f"'{behavior.get('name')}' is a built-in behavior; only custom ones can be changed"
+                )
+            payload = {
+                "measurementType": (
+                    _check_measurement_type(measurement_type)
+                    if measurement_type is not None else behavior.get("measurementType")
+                ),
+                "name": (
+                    _check_behavior_name(name, existing, skip_id=behavior_id)
+                    if name is not None else behavior.get("name")
+                ),
+                "sleepRelated": (
+                    sleep_related if sleep_related is not None else bool(behavior.get("sleepRelated"))
+                ),
+            }
+            tracker.sending()
+            updated = garmin_client.client.put(
+                "connectapi", f"{_LIFESTYLE_URL}/behaviours/{behavior_id}", json=payload, api=True
+            )
+            tracker.committed()
+            summary = _behavior_summary(updated if isinstance(updated, dict) else {})
+            # The update response always says tracked=false; keep the real state.
+            summary["tracked"] = behavior.get("tracked")
+            return json.dumps({"status": "success", "behavior": summary}, indent=2)
+        except Exception as e:
+            return tracker.error(e)
+
+    @app.tool()
+    async def delete_lifestyle_behaviors(
+        behavior_ids: List[int], confirm: bool = False
+    ) -> str:
+        """Permanently delete custom lifestyle behaviors
+
+        Only custom behaviors can be deleted; to stop seeing a built-in one,
+        drop it with set_tracked_lifestyle_behaviors instead. This cannot be
+        undone. The default call previews the behaviors; call again with
+        confirm=true to delete them. Deleted behaviors are also removed from
+        the tracked list.
+
+        Args:
+            behavior_ids: Custom behavior ids from get_lifestyle_behaviors
+            confirm: Set true to delete after reviewing the default preview
+        """
+        tracker = WriteTracker("delete_lifestyle_behaviors", "Error deleting lifestyle behaviors")
+        try:
+            if not isinstance(behavior_ids, list) or not behavior_ids:
+                raise ValueError("behavior_ids must be a non-empty list")
+            ids = list(dict.fromkeys(behavior_ids))
+            day = _lifestyle_date(None)
+            existing = _lifestyle_behaviors(day)
+            if not existing:
+                raise ValueError("Could not read the behavior list; nothing was deleted")
+            by_id = {b.get("behaviourId"): b for b in existing}
+            targets = [by_id[i] for i in ids if i in by_id]
+            # Ids that are no longer listed were already deleted (e.g. by an
+            # earlier attempt that timed out), so a retry still succeeds.
+            already_deleted = [i for i in ids if i not in by_id]
+            built_in = [t.get("name") for t in targets if not _is_custom_behavior(t)]
+            if built_in:
+                raise ValueError(
+                    "Built-in behaviors cannot be deleted: " + ", ".join(map(str, built_in))
+                    + ". Use set_tracked_lifestyle_behaviors to stop tracking them."
+                )
+            if not confirm:
+                preview: Dict[str, Any] = {
+                    "status": "needs_confirmation",
+                    "behaviors": [_behavior_summary(t) for t in targets],
+                    "message": "Review these behaviors, then call again with confirm=true to permanently delete them.",
+                }
+                if already_deleted:
+                    preview["not_found"] = already_deleted
+                return json.dumps(preview, indent=2)
+
+            result: Dict[str, Any] = {
+                "status": "success",
+                "deleted": [{"id": t.get("behaviourId"), "name": t.get("name")} for t in targets],
+            }
+            if already_deleted:
+                result["already_deleted"] = already_deleted
+            if not targets:
+                return json.dumps(result, indent=2)
+            delete_ids = [t.get("behaviourId") for t in targets]
+            tracker.sending()
+            garmin_client.client.delete(
+                "connectapi", f"{_LIFESTYLE_URL}/behaviours/batchDelete", json={"ids": delete_ids}
+            )
+            tracker.committed()
+            tracked = [b["behaviourId"] for b in existing if b.get("tracked")]
+            remaining = [i for i in tracked if i not in ids]
+            if remaining != tracked:
+                try:
+                    _put_tracked_behaviors(remaining, day, _lifestyle_profile_pk(existing))
+                except Exception as track_error:
+                    result["status"] = "partial"
+                    result["tracking_error"] = str(track_error)
+                    result["hint"] = (
+                        "The behaviors were deleted but are still in the tracked list. "
+                        "Call set_tracked_lifestyle_behaviors without them."
+                    )
+            return json.dumps(result, indent=2)
+        except Exception as e:
+            return tracker.error(e)
+
+    @app.tool()
+    async def set_tracked_lifestyle_behaviors(
+        behavior_ids: List[int], date: Optional[str] = None
+    ) -> str:
+        """Choose which lifestyle behaviors are tracked, and their order
+
+        Replaces the whole tracked list: behaviors left out stop showing up
+        for logging (their past entries are kept). Start from the tracked ids
+        in get_lifestyle_behaviors and add or remove ids.
+
+        The ids are sent in the order given, but Garmin's behavior list doesn't
+        report a custom order, and create_lifestyle_behaviors and
+        delete_lifestyle_behaviors rewrite the list in Garmin's default order.
+        Don't rely on the order being kept.
+
+        Args:
+            behavior_ids: Every behavior id to track
+            date: Date the change applies from, YYYY-MM-DD (defaults to today)
+        """
+        tracker = WriteTracker(
+            "set_tracked_lifestyle_behaviors", "Error updating tracked lifestyle behaviors"
+        )
+        try:
+            if not isinstance(behavior_ids, list) or not behavior_ids:
+                raise ValueError("behavior_ids must be a non-empty list")
+            ids = list(dict.fromkeys(behavior_ids))
+            day = _lifestyle_date(date)
+            existing = _lifestyle_behaviors(day)
+            names = {b["behaviourId"]: b.get("name") for b in existing}
+            unknown = [i for i in ids if i not in names]
+            if unknown:
+                raise ValueError(
+                    f"Unknown behavior ids {unknown}; use get_lifestyle_behaviors to list ids"
+                )
+            before = [b["behaviourId"] for b in existing if b.get("tracked")]
+            profile_pk = _lifestyle_profile_pk(existing)
+            tracker.sending()
+            resp = _put_tracked_behaviors(ids, day, profile_pk)
+            tracker.committed()
+            after = resp.get("trackedBehaviours", ids) if isinstance(resp, dict) else ids
+            return json.dumps({
+                "status": "success",
+                "date": day,
+                "added": [{"id": i, "name": names.get(i)} for i in after if i not in before],
+                "removed": [{"id": i, "name": names.get(i)} for i in before if i not in after],
+                "tracked": [{"id": i, "name": names.get(i)} for i in after],
+            }, indent=2)
+        except Exception as e:
+            return tracker.error(e)
+
+    @app.tool()
+    async def set_lifestyle_auto_logging(enabled: bool) -> str:
+        """Turn automatic logging of exercise behaviors on or off
+
+        When on, Garmin logs auto-loggable behaviors (Light, Moderate and
+        Vigorous Exercise) from recorded activities.
+
+        Args:
+            enabled: true to turn auto-logging on, false to turn it off
+        """
+        tracker = WriteTracker("set_lifestyle_auto_logging", "Error updating lifestyle auto-logging")
+        try:
+            if not isinstance(enabled, bool):
+                raise ValueError("enabled must be true or false")
+            tracker.sending()
+            resp = garmin_client.client.put(
+                "connectapi",
+                _AUTO_LOG_URL,
+                json={"key": _AUTO_LOG_KEY, "value": "true" if enabled else "false"},
+                api=True,
+            )
+            tracker.committed()
+            value = resp.get("value") if isinstance(resp, dict) else None
+            return json.dumps({
+                "status": "success",
+                "auto_logging_enabled": str(value).lower() == "true" if value is not None else enabled,
+            }, indent=2)
+        except Exception as e:
+            return tracker.error(e)
 
     @app.tool()
     async def get_weekly_steps(end_date: str, weeks: int = 4) -> str:

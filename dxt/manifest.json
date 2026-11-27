@@ -11,9 +11,9 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/Taxuspt/garmin_mcp"
+    "url": "https://github.com/ttlopes/garmin_mcp"
   },
-  "homepage": "https://github.com/Taxuspt/garmin_mcp",
+  "homepage": "https://github.com/ttlopes/garmin_mcp",
   "license": "MIT",
   "keywords": [
     "garmin",
@@ -33,7 +33,7 @@
         "--python",
         "3.12",
         "--from",
-        "git+https://github.com/Taxuspt/garmin_mcp",
+        "git+https://github.com/ttlopes/garmin_mcp",
         "garmin-mcp"
       ],
       "env": {
@@ -88,12 +88,20 @@
       "description": "Add a new weight measurement with specific timestamps"
     },
     {
+      "name": "clear_lifestyle_behavior_log",
+      "description": "Remove a behavior's entry for a day, leaving it unanswered"
+    },
+    {
       "name": "count_activities",
       "description": "Get total count of activities in the user's Garmin account"
     },
     {
       "name": "create_custom_food",
       "description": "Create a custom food in the user's Garmin nutrition library"
+    },
+    {
+      "name": "create_lifestyle_behaviors",
+      "description": "Create custom lifestyle behaviors"
     },
     {
       "name": "create_manual_activity",
@@ -134,6 +142,10 @@
     {
       "name": "delete_food_log",
       "description": "Delete a food log entry"
+    },
+    {
+      "name": "delete_lifestyle_behaviors",
+      "description": "Permanently delete custom lifestyle behaviors"
     },
     {
       "name": "delete_weigh_ins",
@@ -384,6 +396,10 @@
       "description": "Get lactate threshold data"
     },
     {
+      "name": "get_lifestyle_behaviors",
+      "description": "List the lifestyle behaviors that can be logged, with their ids"
+    },
+    {
       "name": "get_lifestyle_logging_data",
       "description": "Get lifestyle logging data for a specific date"
     },
@@ -592,6 +608,10 @@
       "description": "Quick-add a food entry with macro values to the nutrition log"
     },
     {
+      "name": "log_lifestyle_behavior",
+      "description": "Log a lifestyle behavior for a day (yes/no or a count)"
+    },
+    {
       "name": "push_workout_to_device",
       "description": "Send a workout from the workout library to a Garmin device"
     },
@@ -660,12 +680,20 @@
       "description": "Set an account-level heart-rate training-zone configuration for one sport."
     },
     {
+      "name": "set_lifestyle_auto_logging",
+      "description": "Turn automatic logging of exercise behaviors on or off"
+    },
+    {
       "name": "set_nutrition_daily_settings",
       "description": "Update daily nutrition goals (calorie target and macronutrient targets)."
     },
     {
       "name": "set_perceived_effort",
       "description": "Set the perceived effort (RPE) for an activity."
+    },
+    {
+      "name": "set_tracked_lifestyle_behaviors",
+      "description": "Choose which lifestyle behaviors are tracked, and their order"
     },
     {
       "name": "unschedule_workout",
@@ -678,6 +706,10 @@
     {
       "name": "update_custom_food",
       "description": "Update an existing custom food in the user's Garmin nutrition library"
+    },
+    {
+      "name": "update_lifestyle_behavior",
+      "description": "Rename or change a custom lifestyle behavior"
     },
     {
       "name": "upload_course",
