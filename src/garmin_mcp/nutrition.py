@@ -323,13 +323,62 @@ _REGION_RE = re.compile(r"[A-Za-z]{2}")
 _LANGUAGE_RE = re.compile(r"[A-Za-z]{2,3}(-[A-Za-z0-9]{2,8})*")
 
 
-def _check_region_language(region_code: str, language_code: str) -> tuple:
-    """Validate and normalize a country code ("PT") and language tag ("pt-PT")."""
+_FALLBACK_REGION = "US"
+_FALLBACK_LANGUAGE = "en"
+
+
+def _check_region(region_code) -> str:
+    """Validate and normalize a two-letter country code ("pt" -> "PT")."""
     if not isinstance(region_code, str) or not _REGION_RE.fullmatch(region_code.strip()):
         raise ValueError("region_code must be a two-letter country code, e.g. 'US' or 'PT'")
+    return region_code.strip().upper()
+
+
+def _check_language(language_code) -> str:
+    """Validate a language tag ("en", "pt-PT")."""
     if not isinstance(language_code, str) or not _LANGUAGE_RE.fullmatch(language_code.strip()):
         raise ValueError("language_code must be a language tag, e.g. 'en' or 'pt-PT'")
-    return region_code.strip().upper(), language_code.strip()
+    return language_code.strip()
+
+
+def _resolve_region_language(
+    region_code: Optional[str], language_code: Optional[str], date: Optional[str] = None
+) -> tuple:
+    """Catalog region and language for food lookups and logs.
+
+    Values the caller passes win. Missing ones come from the user's nutrition
+    settings (regionCode / languageCode, the food database region the Garmin
+    Connect app uses for barcode scans), then fall back to US / en. The
+    settings language is only used with the settings region, so an explicit
+    region_code="US" never gets paired with a Portuguese language tag.
+    """
+    region = _check_region(region_code) if region_code is not None else None
+    language = _check_language(language_code) if language_code is not None else None
+    if region is not None and language is not None:
+        return region, language
+
+    settings_region = settings_language = None
+    try:
+        day = date or datetime.date.today().isoformat()
+        settings = garmin_client.connectapi(f"/nutrition-service/settings/{day}")
+    except Exception:
+        settings = None
+    if isinstance(settings, dict):
+        try:
+            settings_region = _check_region(settings.get("regionCode"))
+            settings_language = _check_language(settings.get("languageCode"))
+        except ValueError:
+            settings_region = settings_language = None
+
+    if region is None:
+        region = settings_region or _FALLBACK_REGION
+    if language is None:
+        language = (
+            settings_language
+            if settings_language and region == settings_region
+            else _FALLBACK_LANGUAGE
+        )
+    return region, language
 
 
 def configure(client):
@@ -608,16 +657,19 @@ def register_tools(app):
     @app.tool()
     async def lookup_food_by_barcode(
         barcode: str,
-        region_code: str = "US",
-        language_code: str = "en",
+        region_code: Optional[str] = None,
+        language_code: Optional[str] = None,
     ) -> str:
         """Look up a packaged food by its barcode (EAN/UPC), like the app's scanner
 
         Returns the matching catalog food with food_id, source, name, brand and
         its servings with macros, in the same shape as search_foods. Garmin's
-        catalog (mostly FatSecret) is regional, so pass the country the product
-        was bought in: the same barcode can return a different entry, or none,
-        in another region.
+        catalog (mostly FatSecret) is regional: the same barcode can return a
+        different entry, or none, in another region.
+
+        By default it uses the food database region from the user's nutrition
+        settings, as the app does (falling back to US / en). Pass region_code
+        to look the product up in another country's catalog.
 
         To log the result, pass its food_id, a serving_id, source, region and
         language to log_custom_food (as region_code and language_code).
@@ -625,14 +677,16 @@ def register_tools(app):
         Args:
             barcode: Digits printed under the barcode (8-14 digits; spaces and
                 dashes are ignored)
-            region_code: Two-letter country code, e.g. "US", "GB", "PT" (default "US")
-            language_code: Language tag for names, e.g. "en", "pt-PT" (default "en")
+            region_code: Two-letter country code, e.g. "US", "GB", "PT"
+                (default: the user's nutrition settings)
+            language_code: Language tag for names, e.g. "en", "pt-PT"
+                (default: the user's nutrition settings)
         """
         try:
             code = re.sub(r"[\s-]", "", barcode or "")
             if not _BARCODE_RE.fullmatch(code):
                 return "Error: barcode must be 8 to 14 digits (EAN-8, UPC-A, EAN-13 or GTIN-14)."
-            region, language = _check_region_language(region_code, language_code)
+            region, language = _resolve_region_language(region_code, language_code)
             try:
                 data = garmin_client.connectapi(
                     "/nutrition-service/food/search/barCode",
@@ -1048,8 +1102,8 @@ def register_tools(app):
         serving_id: str,
         serving_qty: float = 1,
         source: str = "GARMIN",
-        region_code: str = "US",
-        language_code: str = "en",
+        region_code: Optional[str] = None,
+        language_code: Optional[str] = None,
     ) -> str:
         """Log a food item to a meal on a date
 
@@ -1076,16 +1130,26 @@ def register_tools(app):
             serving_qty: Number of servings (default 1)
             source: Food namespace — "GARMIN" (default) or "FATSECRET"
             region_code: Catalog region of the food, e.g. "US" or "PT" — use the
-                region from lookup_food_by_barcode or search_foods (default "US")
+                region from lookup_food_by_barcode or search_foods. Defaults to
+                the user's nutrition settings for FATSECRET foods and to "US"
+                for GARMIN custom foods (which this server creates as US/en)
             language_code: Catalog language of the food, e.g. "en" or "pt-PT"
-                (default "en")
+                (defaults like region_code)
         """
         tracker = WriteTracker("log_custom_food", "Error logging food")
         try:
             from datetime import datetime, timezone
 
             _validate_meal_datetime(meal_date, meal_time)
-            region_code, language_code = _check_region_language(region_code, language_code)
+            if str(source).upper() == "GARMIN":
+                region_code = _check_region(region_code) if region_code is not None else _FALLBACK_REGION
+                language_code = (
+                    _check_language(language_code) if language_code is not None else _FALLBACK_LANGUAGE
+                )
+            else:
+                region_code, language_code = _resolve_region_language(
+                    region_code, language_code, meal_date
+                )
 
             meals_url = f"/nutrition-service/meals/{meal_date}"
             meals_data = garmin_client.connectapi(meals_url)

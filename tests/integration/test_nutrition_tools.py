@@ -2524,14 +2524,82 @@ async def test_lookup_food_by_barcode_found(app_with_nutrition, mock_garmin_clie
     assert food["servings"][0]["calories"] == 0
 
 
+_NUTRITION_SETTINGS_PT = {"calorieGoal": 2683, "regionCode": "PT", "languageCode": "pt-PT"}
+
+
+def _route(settings, food=_BARCODE_RESPONSE):
+    """connectapi side effect: nutrition settings vs. barcode lookup."""
+    def connectapi(path, **kwargs):
+        if path.startswith("/nutrition-service/settings/"):
+            if isinstance(settings, Exception):
+                raise settings
+            return settings
+        if path == "/nutrition-service/food/search/barCode":
+            return food
+        if path.startswith("/nutrition-service/meals/"):
+            return MOCK_MEALS
+        raise AssertionError(f"unexpected GET {path}")
+    return connectapi
+
+
+def _barcode_params(mock_garmin_client):
+    calls = [c for c in mock_garmin_client.connectapi.call_args_list
+             if c[0][0] == "/nutrition-service/food/search/barCode"]
+    assert len(calls) == 1
+    return calls[0][1]["params"]
+
+
 @pytest.mark.asyncio
-async def test_lookup_food_by_barcode_defaults_to_us(app_with_nutrition, mock_garmin_client):
-    mock_garmin_client.connectapi.return_value = _BARCODE_RESPONSE
+async def test_lookup_food_by_barcode_defaults_to_nutrition_settings(
+    app_with_nutrition, mock_garmin_client
+):
+    """With no region given, use the food database region from nutrition settings."""
+    mock_garmin_client.connectapi.side_effect = _route(_NUTRITION_SETTINGS_PT)
+    await app_with_nutrition.call_tool("lookup_food_by_barcode", {"barcode": "5000112686333"})
+    params = _barcode_params(mock_garmin_client)
+    assert (params["regionCode"], params["languageCode"], params["phoneCountryCode"]) == (
+        "PT", "pt-PT", "PT",
+    )
+
+
+@pytest.mark.parametrize("settings", [
+    Exception("settings down"), None, {"calorieGoal": 2000},
+    {"regionCode": "Portugal", "languageCode": "pt-PT"},
+])
+@pytest.mark.asyncio
+async def test_lookup_food_by_barcode_falls_back_to_us(
+    app_with_nutrition, mock_garmin_client, settings
+):
+    mock_garmin_client.connectapi.side_effect = _route(settings)
     await app_with_nutrition.call_tool("lookup_food_by_barcode", {"barcode": "012345678905"})
-    params = mock_garmin_client.connectapi.call_args[1]["params"]
-    assert params["regionCode"] == "US"
-    assert params["languageCode"] == "en"
-    assert params["phoneCountryCode"] == "US"
+    params = _barcode_params(mock_garmin_client)
+    assert (params["regionCode"], params["languageCode"]) == ("US", "en")
+
+
+@pytest.mark.asyncio
+async def test_lookup_food_by_barcode_explicit_region_overrides_settings(
+    app_with_nutrition, mock_garmin_client
+):
+    """An explicit other region doesn't borrow the settings' Portuguese language."""
+    mock_garmin_client.connectapi.side_effect = _route(_NUTRITION_SETTINGS_PT)
+    await app_with_nutrition.call_tool(
+        "lookup_food_by_barcode", {"barcode": "012345678905", "region_code": "us"}
+    )
+    params = _barcode_params(mock_garmin_client)
+    assert (params["regionCode"], params["languageCode"]) == ("US", "en")
+
+
+@pytest.mark.asyncio
+async def test_lookup_food_by_barcode_explicit_values_skip_settings(
+    app_with_nutrition, mock_garmin_client
+):
+    mock_garmin_client.connectapi.side_effect = _route(_NUTRITION_SETTINGS_PT)
+    await app_with_nutrition.call_tool(
+        "lookup_food_by_barcode",
+        {"barcode": "012345678905", "region_code": "GB", "language_code": "en-GB"},
+    )
+    paths = [c[0][0] for c in mock_garmin_client.connectapi.call_args_list]
+    assert paths == ["/nutrition-service/food/search/barCode"]
 
 
 @pytest.mark.parametrize("response", [None, {}, {"foodMetaData": None}])
@@ -2633,3 +2701,38 @@ async def test_log_custom_food_rejects_bad_region(app_with_nutrition, mock_garmi
     assert "two-letter country code" in data["message"]
     assert data["write_committed"] is False
     mock_garmin_client.client.put.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_log_custom_food_fatsecret_defaults_to_nutrition_settings(
+    app_with_nutrition, mock_garmin_client
+):
+    mock_garmin_client.connectapi.side_effect = _route(_NUTRITION_SETTINGS_PT)
+    mock_garmin_client.client.put.return_value = {"status": "ok"}
+    await app_with_nutrition.call_tool(
+        "log_custom_food",
+        {
+            "meal_date": "2024-01-15", "meal_time": "12:30:00", "food_id": "3291590",
+            "serving_id": "3202246", "source": "FATSECRET",
+        },
+    )
+    mock_garmin_client.connectapi.assert_any_call("/nutrition-service/settings/2024-01-15")
+    item = mock_garmin_client.client.put.call_args[1]["json"]["foodLogItems"][0]
+    assert (item["regionCode"], item["languageCode"]) == ("PT", "pt-PT")
+
+
+@pytest.mark.asyncio
+async def test_log_custom_food_garmin_food_ignores_nutrition_settings(
+    app_with_nutrition, mock_garmin_client
+):
+    """Custom foods are created as US/en, so they keep logging as US/en."""
+    mock_garmin_client.connectapi.side_effect = _route(_NUTRITION_SETTINGS_PT)
+    mock_garmin_client.client.put.return_value = {"status": "ok"}
+    await app_with_nutrition.call_tool(
+        "log_custom_food",
+        {"meal_date": "2024-01-15", "meal_time": "12:30:00", "food_id": "abc123", "serving_id": "srv456"},
+    )
+    paths = [c[0][0] for c in mock_garmin_client.connectapi.call_args_list]
+    assert not any(p.startswith("/nutrition-service/settings/") for p in paths)
+    item = mock_garmin_client.client.put.call_args[1]["json"]["foodLogItems"][0]
+    assert (item["regionCode"], item["languageCode"]) == ("US", "en")
